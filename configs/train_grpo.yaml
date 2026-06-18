@@ -1,0 +1,68 @@
+# @package _global_
+
+defaults:
+  - _self_
+  - data: navsim
+  - model: fastwam_navsim_grpo
+  - task: null
+
+output_dir: ./runs/grpo/${now:%Y-%m-%d}_${now:%H-%M-%S}
+
+batch_size: 2
+num_workers: 4
+# scheduler
+lr_scheduler_type: constant
+learning_rate: 1.0e-6
+weight_decay: 0.0
+num_epochs: 100
+max_steps: null
+log_every: 1
+save_every: 10
+eval_every: 0
+eval_num_inference_steps: 10
+
+
+gradient_accumulation_steps: 1
+mixed_precision: bf16
+seed: 42
+max_grad_norm: 1.0
+
+# IL checkpoint to initialize GRPO from. This is intentionally the same key as
+# the existing trainer so command-line overrides can use `resume=/path/to.pt`.
+resume: null
+
+grpo:
+  sample:
+    train_batch_size: ${batch_size}
+    num_image_per_prompt: 2
+    sample_time_per_prompt: 1
+    num_batches_per_epoch: 1
+    num_steps: 10
+    kl_reward: 0.0
+  train:
+    batch_size: ${grpo.sample.train_batch_size}
+    gradient_accumulation_steps: ${gradient_accumulation_steps}
+    num_inner_epochs: 1
+    timestep_fraction: 1.0
+    clip_range: 1.0e-4
+    adv_clip_max: 5.0
+    beta: 0.0
+  video_reward_metric: psnr  # supports single metric or combinations like psnr+ssim, psnr,ssim,fid
+  video_reward_metric_weights: {}  # e.g. {psnr: 0.7, ssim: 0.3}
+  video_reward_weight: 1.0
+  pdm_reward_weight: 1.0
+  metric_cache_path: ${oc.env:NAVSIM_METRIC_CACHE_PATH}
+  tiled: false
+  # null uses NAVSIM's default_scoring_parameters.yaml for proposal_sampling/simulator/scorer.
+  pdm_scoring_config_path: null
+  pdm_scorer_config:
+    progress_weight: 10.0
+    ttc_weight: 5.0
+    comfortable_weight: 2.0
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null

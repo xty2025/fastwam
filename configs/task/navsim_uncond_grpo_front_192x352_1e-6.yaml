@@ -1,0 +1,61 @@
+# @package _global_
+
+defaults:
+  - override /data: navsim
+  - override /model: fastwam_navsim_grpo
+  - _self_
+
+
+batch_size: 2
+num_workers: 4
+
+data:
+  train:
+    video_size: [192, 352]
+    camera_layout: front
+    use_dynamic_prompt: false
+
+model:
+  mot_checkpoint_mixed_attn: true
+
+lr_scheduler_type: constant
+learning_rate: 1.0e-6
+num_epochs: 100
+max_steps: null
+log_every: 10
+save_every: 500
+eval_every: 0
+eval_num_inference_steps: 10
+
+gradient_accumulation_steps: 1
+weight_decay: 0.0
+resume: null
+
+grpo:
+  sample:
+    train_batch_size: ${batch_size}
+    num_image_per_prompt: 2
+    sample_time_per_prompt: 1
+    num_batches_per_epoch: 1
+    num_steps: 10
+    kl_reward: 0.0
+  train:
+    batch_size: ${grpo.sample.train_batch_size}
+    gradient_accumulation_steps: ${gradient_accumulation_steps}
+    num_inner_epochs: 1
+    timestep_fraction: 1.0
+    clip_range: 1.0e-4
+    adv_clip_max: 5.0
+    beta: 0.0
+  video_reward_metric: psnr
+  video_reward_metric_weights: {}
+  video_reward_weight: 1.0
+  pdm_reward_weight: 1.0
+  metric_cache_path: ${oc.env:NAVSIM_METRIC_CACHE_PATH}
+  tiled: false
+  pdm_scoring_config_path: null
+  pdm_scorer_config: null
+  # pdm_scorer_config:
+  #   progress_weight: 10.0
+  #   ttc_weight: 5.0
+  #   comfortable_weight: 2.0
