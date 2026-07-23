@@ -33,6 +33,7 @@ class Camera:
     """Camera dataclass for image and parameters."""
 
     image: Optional[npt.NDArray[np.float32]] = None
+    data_path: Optional[str] = None
 
     sensor2lidar_rotation: Optional[npt.NDArray[np.float32]] = None
     sensor2lidar_translation: Optional[npt.NDArray[np.float32]] = None
@@ -75,6 +76,7 @@ class Cameras:
                 image_path = sensor_blobs_path / camera_dict[camera_name]["data_path"]
                 data_dict[camera_identifier] = Camera(
                     image=np.array(Image.open(image_path)),
+                    data_path=str(camera_dict[camera_name]["data_path"]),
                     sensor2lidar_rotation=camera_dict[camera_name]["sensor2lidar_rotation"],
                     sensor2lidar_translation=camera_dict[camera_name]["sensor2lidar_translation"],
                     intrinsics=camera_dict[camera_name]["cam_intrinsic"],

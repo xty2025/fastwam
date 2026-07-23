@@ -14,6 +14,7 @@ from navsim.common.dataclasses import SceneFilter, SensorConfig
 from navsim.common.dataloader import SceneLoader
 
 from .flow_generator import BEVFlowConfig, generate_navsim_bev_flow, generate_navsim_bev_flow_target
+from ..depth_sequence import MetadataDepthSequence
 
 logger = get_logger(__name__)
 
@@ -56,6 +57,12 @@ class NavSimVideoDataset(torch.utils.data.Dataset):
         flow_rgb_ckpt: str = "sintel",
         flow_rgb_frame_a: int = 0,
         flow_rgb_frame_b: int = 1,
+        depth_root: Optional[str] = None,
+        depth_metadata_glob: str = "*",
+        depth_alignment_mode: str = "source_path_then_token_then_timestamp",
+        depth_timestamp_scale: float = 1.0,
+        depth_timestamp_tolerance: float = 0.0,
+        depth_camera_key: Optional[str] = None,
         missing_sensor_policy: str = "error",
     ):
         super().__init__()
@@ -106,6 +113,18 @@ class NavSimVideoDataset(torch.utils.data.Dataset):
         self.flow_rgb_ckpt = str(flow_rgb_ckpt)
         self.flow_rgb_frame_a = int(flow_rgb_frame_a)
         self.flow_rgb_frame_b = int(flow_rgb_frame_b)
+        self.depth_loader = None
+        if depth_root is not None:
+            self.depth_loader = MetadataDepthSequence(
+                depth_root,
+                image_size=self.video_size,
+                num_frames=self.num_frames,
+                metadata_glob=depth_metadata_glob,
+                alignment_mode=depth_alignment_mode,
+                timestamp_scale=depth_timestamp_scale,
+                timestamp_tolerance=depth_timestamp_tolerance,
+                camera_key=depth_camera_key,
+            )
 
         if self.num_frames < 2:
             raise ValueError(f"`num_frames` must be >= 2, got {self.num_frames}")
@@ -271,6 +290,16 @@ class NavSimVideoDataset(torch.utils.data.Dataset):
         if self.generate_flow_rgb:
             flow_rgb = self._get_flow_rgb(token=token)
             sample["flow_rgb"] = flow_rgb
+        if self.depth_loader is not None:
+            depth_rgb, depth_visible = self.depth_loader.load(
+                navsim_tokens=[scene.frames[frame_idx].token for frame_idx in self._frame_indices],
+                navsim_timestamps=[scene.frames[frame_idx].timestamp for frame_idx in self._frame_indices],
+                navsim_image_paths=[
+                    scene.frames[frame_idx].cameras.cam_f0.data_path for frame_idx in self._frame_indices
+                ],
+            )
+            sample["depth_rgb"] = depth_rgb
+            sample["depth_visible"] = depth_visible
         return sample
 
     def _get_flow_rgb(self, token: str) -> torch.Tensor:

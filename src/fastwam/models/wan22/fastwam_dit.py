@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from typing import Any, Optional
 
 import torch
@@ -37,6 +38,19 @@ class FastWAMDiT(FastWAM):
         self.loss_lambda_flow = float(loss_lambda_flow)
         self.flow_expert.to(device=self.device, dtype=self.torch_dtype)
 
+    @property
+    def depth_expert(self) -> WanVideoDiT:
+        """Depth uses the same video-VAE/DiT auxiliary pathway as RGB flow."""
+        return self.flow_expert
+
+    @property
+    def train_depth_scheduler(self) -> WanContinuousFlowMatchScheduler:
+        return self.train_flow_scheduler
+
+    @property
+    def infer_depth_scheduler(self) -> WanContinuousFlowMatchScheduler:
+        return self.infer_flow_scheduler
+
     @classmethod
     def from_wan22_pretrained(
         cls,
@@ -48,7 +62,8 @@ class FastWAMDiT(FastWAM):
         **kwargs,
     ):
         base = FastWAM.from_wan22_pretrained(**kwargs)
-        cfg = dict(kwargs.get("video_dit_config") or {})
+        video_cfg = dict(kwargs.get("video_dit_config") or {})
+        cfg = dict(video_cfg)
         cfg.update(dict(flow_dit_config or {}))
         cfg.setdefault("text_dim", base.text_dim)
         cfg.setdefault("hidden_dim", base.action_expert.hidden_dim)
@@ -67,7 +82,12 @@ class FastWAMDiT(FastWAM):
         cfg.setdefault("fuse_vae_embedding_in_latents", True)
         cfg.setdefault("video_attention_mask_mode", getattr(base.video_expert, "video_attention_mask_mode", "first_frame_causal"))
         cfg.setdefault("action_conditioned", False)
-        flow_expert = WanVideoDiT(**cfg).to(device=base.device, dtype=base.torch_dtype)
+        if cfg != video_cfg:
+            raise ValueError(
+                "Depth DiT must exactly match `video_dit_config` so it can be "
+                "initialized from the fully pretrained Wan Video DiT."
+            )
+        flow_expert = copy.deepcopy(base.video_expert)
         mot = MoT(
             mixtures={
                 "video": base.video_expert,
@@ -139,12 +159,16 @@ class FastWAMDiT(FastWAM):
             noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
             target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
 
-            flow_rgb = sample.get("flow_rgb")
+            depth_rgb = sample.get("depth_rgb")
+            aux_rgb = depth_rgb if depth_rgb is not None else sample.get("flow_rgb")
+            aux_name = "depth" if depth_rgb is not None else "flow"
             flow_pre = None
             target_flow = None
             timestep_flow = None
-            if flow_rgb is not None:
-                flow_latents = self._encode_flow_rgb_latents(flow_rgb, tiled=tiled)
+            if aux_rgb is not None:
+                flow_latents = self._encode_aux_video_latents(
+                    aux_rgb, name=aux_name, tiled=tiled
+                )
                 flow_noise = torch.randn_like(flow_latents)
                 timestep_flow = self.train_flow_scheduler.sample_training_t(
                     batch_size=batch_size,
@@ -153,13 +177,19 @@ class FastWAMDiT(FastWAM):
                 )
                 noisy_flow = self.train_flow_scheduler.add_noise(flow_latents, flow_noise, timestep_flow)
                 target_flow = self.train_flow_scheduler.training_target(flow_latents, flow_noise, timestep_flow)
+                first_aux_frame_latents = None
+                if aux_name == "depth":
+                    first_aux_frame_latents = flow_latents[:, :, 0:1].clone()
+                    noisy_flow[:, :, 0:1] = first_aux_frame_latents
                 flow_pre = self.flow_expert.pre_dit(
                     x=noisy_flow,
                     timestep=timestep_flow,
                     context=context,
                     context_mask=context_mask,
                     action=None,
-                    fuse_vae_embedding_in_latents=False,
+                    fuse_vae_embedding_in_latents=bool(
+                        getattr(self.depth_expert, "fuse_vae_embedding_in_latents", False)
+                    ) if aux_name == "depth" else False,
                 )
 
             video_pre = self.video_expert.pre_dit(
@@ -292,26 +322,43 @@ class FastWAMDiT(FastWAM):
 
             if flow_pre is not None:
                 pred_flow = self.flow_expert.post_dit(tokens_out["flow"], flow_pre)
-                loss_per_sample = F.mse_loss(
+                if aux_name == "depth":
+                    pred_flow = pred_flow[:, :, 1:]
+                    target_flow = target_flow[:, :, 1:]
+                squared_error = F.mse_loss(
                     pred_flow.float(),
                     target_flow.float(),
                     reduction="none",
-                ).mean(dim=(1, 2, 3, 4))
+                )
+                depth_visible = sample.get("depth_visible") if aux_name == "depth" else None
+                if depth_visible is None:
+                    loss_per_sample = squared_error.mean(dim=(1, 2, 3, 4))
+                else:
+                    if aux_name == "depth":
+                        depth_visible = depth_visible[:, :, 1:]
+                    visible = self._latent_visibility_mask(
+                        depth_visible, target_flow, name="depth_visible"
+                    )
+                    visible = visible.to(dtype=squared_error.dtype)
+                    denom = visible.sum(dim=(1, 2, 3, 4)).clamp_min(1.0)
+                    loss_per_sample = (squared_error * visible).sum(dim=(1, 2, 3, 4)) / denom
                 flow_weight = self.train_flow_scheduler.training_weight(timestep_flow).to(
                     device=loss_per_sample.device,
                     dtype=loss_per_sample.dtype,
                 )
                 loss_flow = (loss_per_sample * flow_weight).mean()
                 loss_total = loss_total + self.loss_lambda_flow * loss_flow
-                loss_dict["loss_flow"] = self.loss_lambda_flow * float(loss_flow.detach().item())
+                loss_dict[f"loss_{aux_name}"] = self.loss_lambda_flow * float(loss_flow.detach().item())
             return loss_total, loss_dict
 
-        if "flow_rgb" not in sample:
+        aux_name = "depth" if "depth_rgb" in sample else "flow"
+        aux_rgb = sample.get("depth_rgb", sample.get("flow_rgb"))
+        if aux_rgb is None:
             return loss_total, loss_dict
 
         context = sample["context"].to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
         context_mask = sample["context_mask"].to(device=self.device, dtype=torch.bool, non_blocking=True)
-        flow_latents = self._encode_flow_rgb_latents(sample["flow_rgb"], tiled=tiled)
+        flow_latents = self._encode_aux_video_latents(aux_rgb, name=aux_name, tiled=tiled)
         batch_size = flow_latents.shape[0]
         noise = torch.randn_like(flow_latents)
         timestep = self.train_flow_scheduler.sample_training_t(
@@ -321,23 +368,39 @@ class FastWAMDiT(FastWAM):
         )
         noisy_flow = self.train_flow_scheduler.add_noise(flow_latents, noise, timestep)
         target_flow = self.train_flow_scheduler.training_target(flow_latents, noise, timestep)
+        if aux_name == "depth":
+            noisy_flow[:, :, 0:1] = flow_latents[:, :, 0:1]
         pred_flow = self.flow_expert(
             x=noisy_flow,
             timestep=timestep,
             context=context,
             context_mask=context_mask,
             action=None,
-            fuse_vae_embedding_in_latents=False,
+            fuse_vae_embedding_in_latents=bool(
+                getattr(self.depth_expert, "fuse_vae_embedding_in_latents", False)
+            ) if aux_name == "depth" else False,
         )
 
-        loss_per_sample = F.mse_loss(pred_flow.float(), target_flow.float(), reduction="none").mean(dim=(1, 2, 3, 4))
+        if aux_name == "depth":
+            pred_flow = pred_flow[:, :, 1:]
+            target_flow = target_flow[:, :, 1:]
+        squared_error = F.mse_loss(pred_flow.float(), target_flow.float(), reduction="none")
+        depth_visible = sample.get("depth_visible") if aux_name == "depth" else None
+        if depth_visible is None:
+            loss_per_sample = squared_error.mean(dim=(1, 2, 3, 4))
+        else:
+            if aux_name == "depth":
+                depth_visible = depth_visible[:, :, 1:]
+            visible = self._latent_visibility_mask(depth_visible, target_flow, name="depth_visible")
+            visible = visible.to(dtype=squared_error.dtype)
+            loss_per_sample = (squared_error * visible).sum(dim=(1, 2, 3, 4)) / visible.sum(dim=(1, 2, 3, 4)).clamp_min(1.0)
         weight = self.train_flow_scheduler.training_weight(timestep).to(
             device=loss_per_sample.device,
             dtype=loss_per_sample.dtype,
         )
         loss_flow = (loss_per_sample * weight).mean()
         loss_total = loss_total + self.loss_lambda_flow * loss_flow
-        loss_dict["loss_flow"] = self.loss_lambda_flow * float(loss_flow.detach().item())
+        loss_dict[f"loss_{aux_name}"] = self.loss_lambda_flow * float(loss_flow.detach().item())
         return loss_total, loss_dict
 
     @torch.no_grad()
@@ -590,14 +653,53 @@ class FastWAMDiT(FastWAM):
         }
 
     def _encode_flow_rgb_latents(self, flow_rgb: torch.Tensor, tiled: bool = False) -> torch.Tensor:
+        return self._encode_aux_video_latents(flow_rgb, name="flow_rgb", tiled=tiled)
+
+    def _encode_depth_rgb_latents(self, depth_rgb: torch.Tensor, tiled: bool = False) -> torch.Tensor:
+        return self._encode_aux_video_latents(depth_rgb, name="depth_rgb", tiled=tiled)
+
+    def _encode_aux_video_latents(
+        self,
+        aux_rgb: torch.Tensor,
+        *,
+        name: str,
+        tiled: bool = False,
+    ) -> torch.Tensor:
+        """Encode flow/depth with the exact Wan video VAE used for RGB video."""
+        flow_rgb = aux_rgb
         if flow_rgb.ndim == 4:
             flow_rgb = flow_rgb.unsqueeze(2)
         if flow_rgb.ndim != 5:
-            raise ValueError(f"`sample['flow_rgb']` must be [B,3,H,W] or [B,3,T,H,W], got {tuple(flow_rgb.shape)}")
+            raise ValueError(f"`sample['{name}']` must be [B,3,H,W] or [B,3,T,H,W], got {tuple(flow_rgb.shape)}")
         if flow_rgb.shape[1] != 3:
-            raise ValueError(f"`sample['flow_rgb']` channel dimension must be 3, got {tuple(flow_rgb.shape)}")
+            raise ValueError(f"`sample['{name}']` channel dimension must be 3, got {tuple(flow_rgb.shape)}")
+        if name == "depth" and flow_rgb.shape[2] != 9:
+            raise ValueError(
+                f"`sample['depth_rgb']` must contain current + 8 future frames (T=9), got T={flow_rgb.shape[2]}"
+            )
         flow_rgb = flow_rgb.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
         return self._encode_video_latents(flow_rgb, tiled=tiled)
+
+    @staticmethod
+    def _latent_visibility_mask(
+        visibility: torch.Tensor,
+        latents: torch.Tensor,
+        *,
+        name: str,
+    ) -> torch.Tensor:
+        """Downsample pixel visibility to the VAE latent grid for masked denoising."""
+        if visibility.ndim == 4:
+            visibility = visibility.unsqueeze(1)
+        if visibility.ndim != 5:
+            raise ValueError(f"`{name}` must be [B,T,H,W] or [B,1,T,H,W], got {tuple(visibility.shape)}")
+        if visibility.shape[0] != latents.shape[0]:
+            raise ValueError(f"`{name}` batch mismatch: {visibility.shape[0]} vs {latents.shape[0]}")
+        visible = F.interpolate(
+            visibility.to(dtype=torch.float32),
+            size=latents.shape[-3:],
+            mode="nearest",
+        )
+        return visible.expand(-1, latents.shape[1], -1, -1, -1).gt(0.5)
 
     @torch.no_grad()
     def _build_mot_attention_mask_with_flow(

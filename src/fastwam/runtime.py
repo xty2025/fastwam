@@ -259,6 +259,26 @@ def create_fastwam_dit(
         loss_lambda_flow=float(loss.get("lambda_flow", 1.0)),
     )
 
+
+def create_fastwam_depth(**kwargs):
+    """Create FastWAM with a depth auxiliary branch.
+
+    The implementation intentionally reuses the auxiliary video expert because
+    both flow RGB and three-channel relative-depth sequences are Wan-VAE inputs.
+    """
+    depth_dit_config = kwargs.pop("depth_dit_config", None)
+    depth_scheduler = kwargs.pop("depth_scheduler", None)
+    loss = kwargs.get("loss")
+    if depth_dit_config is not None:
+        kwargs["flow_dit_config"] = depth_dit_config
+    if depth_scheduler is not None:
+        kwargs["flow_scheduler"] = depth_scheduler
+    if loss is not None and "lambda_depth" in loss:
+        loss = dict(loss)
+        loss["lambda_flow"] = loss["lambda_depth"]
+        kwargs["loss"] = loss
+    return create_fastwam_dit(**kwargs)
+
 # ********** create FastWAM joint with video and action DiTs **********
 def create_fastwam_joint(
     model_id: str,
