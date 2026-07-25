@@ -13,7 +13,7 @@ from .wan_video_dit import WanVideoDiT
 
 
 class FastWAMDiT(FastWAM):
-    """FastWAM plus a video-style RGB-flow expert for DPFlow supervision."""
+    """FastWAM with a pretrained-video-initialized auxiliary depth expert."""
 
     def __init__(
         self,
@@ -23,9 +23,31 @@ class FastWAMDiT(FastWAM):
         flow_infer_shift: float = 5.0,
         flow_num_train_timesteps: int = 1000,
         loss_lambda_flow: float = 1.0,
+        depth_mode: str = "future_denoise",
+        depth_mask_ratio: float = 0.4,
+        depth_mask_block_size: int = 4,
+        loss_lambda_masked_depth: float = 1.0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        valid_depth_modes = {
+            "future_denoise",
+            "masked_refinement",
+            "hybrid",
+            "rgb_to_depth_perception",
+        }
+        if depth_mode not in valid_depth_modes:
+            raise ValueError(
+                f"`depth_mode` must be one of {sorted(valid_depth_modes)}, got {depth_mode!r}"
+            )
+        if not 0.0 < depth_mask_ratio <= 1.0:
+            raise ValueError(
+                f"`depth_mask_ratio` must be in (0, 1], got {depth_mask_ratio}"
+            )
+        if depth_mask_block_size <= 0:
+            raise ValueError(
+                f"`depth_mask_block_size` must be positive, got {depth_mask_block_size}"
+            )
         self.flow_expert = flow_expert
         self.train_flow_scheduler = WanContinuousFlowMatchScheduler(
             num_train_timesteps=int(flow_num_train_timesteps),
@@ -36,6 +58,13 @@ class FastWAMDiT(FastWAM):
             shift=float(flow_infer_shift),
         )
         self.loss_lambda_flow = float(loss_lambda_flow)
+        self.depth_mode = depth_mode
+        self.depth_mask_ratio = float(depth_mask_ratio)
+        self.depth_mask_block_size = int(depth_mask_block_size)
+        self.loss_lambda_masked_depth = float(loss_lambda_masked_depth)
+        # This is intentionally zero-initialized rather than randomly initialized.
+        # It represents a masked relative-depth latent without adding a new DiT head.
+        self.depth_mask_embedding = torch.nn.Parameter(torch.zeros(1, 1, 1, 1, 1))
         self.flow_expert.to(device=self.device, dtype=self.torch_dtype)
 
     @property
@@ -59,6 +88,10 @@ class FastWAMDiT(FastWAM):
         flow_infer_shift: float = 5.0,
         flow_num_train_timesteps: int = 1000,
         loss_lambda_flow: float = 1.0,
+        depth_mode: str = "future_denoise",
+        depth_mask_ratio: float = 0.4,
+        depth_mask_block_size: int = 4,
+        loss_lambda_masked_depth: float = 1.0,
         **kwargs,
     ):
         base = FastWAM.from_wan22_pretrained(**kwargs)
@@ -121,6 +154,10 @@ class FastWAMDiT(FastWAM):
             flow_infer_shift=flow_infer_shift,
             flow_num_train_timesteps=flow_num_train_timesteps,
             loss_lambda_flow=loss_lambda_flow,
+            depth_mode=depth_mode,
+            depth_mask_ratio=depth_mask_ratio,
+            depth_mask_block_size=depth_mask_block_size,
+            loss_lambda_masked_depth=loss_lambda_masked_depth,
         )
         model.model_paths = getattr(base, "model_paths", {})
         return model
@@ -165,6 +202,7 @@ class FastWAMDiT(FastWAM):
             flow_pre = None
             target_flow = None
             timestep_flow = None
+            depth_mask = None
             if aux_rgb is not None:
                 flow_latents = self._encode_aux_video_latents(
                     aux_rgb, name=aux_name, tiled=tiled
@@ -175,12 +213,35 @@ class FastWAMDiT(FastWAM):
                     device=self.device,
                     dtype=flow_latents.dtype,
                 )
-                noisy_flow = self.train_flow_scheduler.add_noise(flow_latents, flow_noise, timestep_flow)
-                target_flow = self.train_flow_scheduler.training_target(flow_latents, flow_noise, timestep_flow)
+                if aux_name == "depth" and self.depth_mode == "rgb_to_depth_perception":
+                    # GenCeption-style task contract: RGB is the conditioning
+                    # modality and no depth latent is supplied to the depth query.
+                    # The Wan flow-matching head predicts the velocity from zero
+                    # depth latent to the relative-depth latent, so no separate
+                    # randomly initialized RGB-to-depth decoder is introduced.
+                    timestep_flow = torch.zeros_like(timestep_flow)
+                    noisy_flow = torch.zeros_like(flow_latents)
+                    target_flow = -flow_latents
+                else:
+                    noisy_flow = self.train_flow_scheduler.add_noise(
+                        flow_latents, flow_noise, timestep_flow
+                    )
+                    target_flow = self.train_flow_scheduler.training_target(
+                        flow_latents, flow_noise, timestep_flow
+                    )
                 first_aux_frame_latents = None
-                if aux_name == "depth":
+                if aux_name == "depth" and self.depth_mode != "rgb_to_depth_perception":
                     first_aux_frame_latents = flow_latents[:, :, 0:1].clone()
                     noisy_flow[:, :, 0:1] = first_aux_frame_latents
+                    if self.depth_mode in {"masked_refinement", "hybrid"}:
+                        depth_mask = self._sample_future_depth_block_mask(flow_latents)
+                        noisy_flow = torch.where(
+                            depth_mask,
+                            self.depth_mask_embedding.to(
+                                device=noisy_flow.device, dtype=noisy_flow.dtype
+                            ),
+                            noisy_flow,
+                        )
                 flow_pre = self.flow_expert.pre_dit(
                     x=noisy_flow,
                     timestep=timestep_flow,
@@ -322,7 +383,7 @@ class FastWAMDiT(FastWAM):
 
             if flow_pre is not None:
                 pred_flow = self.flow_expert.post_dit(tokens_out["flow"], flow_pre)
-                if aux_name == "depth":
+                if aux_name == "depth" and self.depth_mode != "rgb_to_depth_perception":
                     pred_flow = pred_flow[:, :, 1:]
                     target_flow = target_flow[:, :, 1:]
                 squared_error = F.mse_loss(
@@ -334,7 +395,7 @@ class FastWAMDiT(FastWAM):
                 if depth_visible is None:
                     loss_per_sample = squared_error.mean(dim=(1, 2, 3, 4))
                 else:
-                    if aux_name == "depth":
+                    if aux_name == "depth" and self.depth_mode != "rgb_to_depth_perception":
                         depth_visible = depth_visible[:, :, 1:]
                     visible = self._latent_visibility_mask(
                         depth_visible, target_flow, name="depth_visible"
@@ -349,6 +410,22 @@ class FastWAMDiT(FastWAM):
                 loss_flow = (loss_per_sample * flow_weight).mean()
                 loss_total = loss_total + self.loss_lambda_flow * loss_flow
                 loss_dict[f"loss_{aux_name}"] = self.loss_lambda_flow * float(loss_flow.detach().item())
+                if aux_name == "depth" and depth_mask is not None:
+                    masked = depth_mask[:, :, 1:].to(dtype=squared_error.dtype)
+                    if depth_visible is not None:
+                        masked = masked * visible
+                    masked_denom = masked.sum(dim=(1, 2, 3, 4)).clamp_min(1.0)
+                    masked_loss_per_sample = (
+                        squared_error * masked
+                    ).sum(dim=(1, 2, 3, 4)) / masked_denom
+                    loss_masked_depth = (masked_loss_per_sample * flow_weight).mean()
+                    if self.depth_mode == "masked_refinement":
+                        loss_total = loss_total - self.loss_lambda_flow * loss_flow
+                    loss_total = loss_total + self.loss_lambda_masked_depth * loss_masked_depth
+                    loss_dict["loss_masked_depth"] = (
+                        self.loss_lambda_masked_depth
+                        * float(loss_masked_depth.detach().item())
+                    )
             return loss_total, loss_dict
 
         aux_name = "depth" if "depth_rgb" in sample else "flow"
@@ -366,10 +443,25 @@ class FastWAMDiT(FastWAM):
             device=self.device,
             dtype=flow_latents.dtype,
         )
-        noisy_flow = self.train_flow_scheduler.add_noise(flow_latents, noise, timestep)
-        target_flow = self.train_flow_scheduler.training_target(flow_latents, noise, timestep)
-        if aux_name == "depth":
+        depth_mask = None
+        if aux_name == "depth" and self.depth_mode == "rgb_to_depth_perception":
+            timestep = torch.zeros_like(timestep)
+            noisy_flow = torch.zeros_like(flow_latents)
+            target_flow = -flow_latents
+        else:
+            noisy_flow = self.train_flow_scheduler.add_noise(flow_latents, noise, timestep)
+            target_flow = self.train_flow_scheduler.training_target(flow_latents, noise, timestep)
+        if aux_name == "depth" and self.depth_mode != "rgb_to_depth_perception":
             noisy_flow[:, :, 0:1] = flow_latents[:, :, 0:1]
+            if self.depth_mode in {"masked_refinement", "hybrid"}:
+                depth_mask = self._sample_future_depth_block_mask(flow_latents)
+                noisy_flow = torch.where(
+                    depth_mask,
+                    self.depth_mask_embedding.to(
+                        device=noisy_flow.device, dtype=noisy_flow.dtype
+                    ),
+                    noisy_flow,
+                )
         pred_flow = self.flow_expert(
             x=noisy_flow,
             timestep=timestep,
@@ -381,7 +473,7 @@ class FastWAMDiT(FastWAM):
             ) if aux_name == "depth" else False,
         )
 
-        if aux_name == "depth":
+        if aux_name == "depth" and self.depth_mode != "rgb_to_depth_perception":
             pred_flow = pred_flow[:, :, 1:]
             target_flow = target_flow[:, :, 1:]
         squared_error = F.mse_loss(pred_flow.float(), target_flow.float(), reduction="none")
@@ -389,7 +481,7 @@ class FastWAMDiT(FastWAM):
         if depth_visible is None:
             loss_per_sample = squared_error.mean(dim=(1, 2, 3, 4))
         else:
-            if aux_name == "depth":
+            if aux_name == "depth" and self.depth_mode != "rgb_to_depth_perception":
                 depth_visible = depth_visible[:, :, 1:]
             visible = self._latent_visibility_mask(depth_visible, target_flow, name="depth_visible")
             visible = visible.to(dtype=squared_error.dtype)
@@ -401,6 +493,21 @@ class FastWAMDiT(FastWAM):
         loss_flow = (loss_per_sample * weight).mean()
         loss_total = loss_total + self.loss_lambda_flow * loss_flow
         loss_dict[f"loss_{aux_name}"] = self.loss_lambda_flow * float(loss_flow.detach().item())
+        if aux_name == "depth" and depth_mask is not None:
+            masked = depth_mask[:, :, 1:].to(dtype=squared_error.dtype)
+            if depth_visible is not None:
+                masked = masked * visible
+            masked_loss_per_sample = (squared_error * masked).sum(dim=(1, 2, 3, 4))
+            masked_loss_per_sample = masked_loss_per_sample / masked.sum(
+                dim=(1, 2, 3, 4)
+            ).clamp_min(1.0)
+            loss_masked_depth = (masked_loss_per_sample * weight).mean()
+            if self.depth_mode == "masked_refinement":
+                loss_total = loss_total - self.loss_lambda_flow * loss_flow
+            loss_total = loss_total + self.loss_lambda_masked_depth * loss_masked_depth
+            loss_dict["loss_masked_depth"] = (
+                self.loss_lambda_masked_depth * float(loss_masked_depth.detach().item())
+            )
         return loss_total, loss_dict
 
     @torch.no_grad()
@@ -679,6 +786,35 @@ class FastWAMDiT(FastWAM):
             )
         flow_rgb = flow_rgb.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
         return self._encode_video_latents(flow_rgb, tiled=tiled)
+
+    def _sample_future_depth_block_mask(self, latents: torch.Tensor) -> torch.Tensor:
+        """Sample a spatial block mask on D1:8 at Wan-VAE latent resolution."""
+        if latents.ndim != 5:
+            raise ValueError(f"`latents` must be [B,C,T,H,W], got {tuple(latents.shape)}")
+        batch_size, _, frames, height, width = latents.shape
+        mask = torch.zeros(
+            (batch_size, 1, frames, height, width),
+            device=latents.device,
+            dtype=torch.bool,
+        )
+        if frames <= 1:
+            return mask
+        block_size = self.depth_mask_block_size
+        grid_height = (height + block_size - 1) // block_size
+        grid_width = (width + block_size - 1) // block_size
+        grid = torch.rand(
+            (batch_size, 1, frames - 1, grid_height, grid_width),
+            device=latents.device,
+        ).lt(self.depth_mask_ratio)
+        if not bool(grid.any()):
+            grid[0, 0, 0, 0, 0] = True
+        future_mask = F.interpolate(
+            grid.to(dtype=torch.float32),
+            size=(frames - 1, height, width),
+            mode="nearest",
+        ).to(dtype=torch.bool)
+        mask[:, :, 1:] = future_mask
+        return mask.expand(-1, latents.shape[1], -1, -1, -1)
 
     @staticmethod
     def _latent_visibility_mask(

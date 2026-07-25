@@ -18,7 +18,9 @@ GPU_COUNT="$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}"
 export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 export MASTER_PORT="${MASTER_PORT:-29501}"
+DEPTH_MODE="${DEPTH_MODE:-future_denoise}"
 echo "Effective global batch: 4 per GPU x 16 GPUs x 3 accumulation = 192"
+echo "Depth experiment mode: ${DEPTH_MODE}"
 
 cd "${ROOT}"
 "${TORCHRUN}" --standalone --nnodes=1 --nproc_per_node=16 \
@@ -26,4 +28,5 @@ cd "${ROOT}"
   batch_size=4 gradient_accumulation_steps=3 \
   model.action_dit_pretrained_path="${ACTION_DIT_CHECKPOINT}" \
   model.skip_dit_load_from_pretrain=false \
+  model.depth_experiment.mode="${DEPTH_MODE}" \
   "$@"

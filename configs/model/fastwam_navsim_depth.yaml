@@ -76,6 +76,15 @@ depth_scheduler:
   train_shift: 5.0
   infer_shift: 5.0
   num_train_timesteps: 1000
+depth_experiment:
+  # future_denoise: FastWAM baseline, D0 condition -> denoise D1:8.
+  # masked_refinement: LingBot-inspired latent block masking on D1:8.
+  # hybrid: baseline loss plus the masked-depth loss.
+  # rgb_to_depth_perception: GenCeption-inspired zero-depth query -> depth latent.
+  mode: future_denoise
+  mask_ratio: 0.4
+  mask_block_size: 4
+  lambda_masked_depth: 1.0
 loss:
   lambda_action: 1.0
   lambda_depth: 1.0

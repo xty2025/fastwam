@@ -12,7 +12,9 @@ ACTION_DIT_CHECKPOINT="${DIFFSYNTH_MODEL_BASE_PATH}/ActionDiT_linear_interp_Wan2
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 export MASTER_PORT="${MASTER_PORT:-29500}"
+DEPTH_MODE="${DEPTH_MODE:-future_denoise}"
 echo "Effective global batch: 1 per GPU x 1 GPU x 3 accumulation = 3"
+echo "Depth experiment mode: ${DEPTH_MODE}"
 
 cd "${ROOT}"
 "${TORCHRUN}" --standalone --nnodes=1 --nproc_per_node=1 \
@@ -20,4 +22,5 @@ cd "${ROOT}"
   batch_size=1 gradient_accumulation_steps=3 \
   model.action_dit_pretrained_path="${ACTION_DIT_CHECKPOINT}" \
   model.skip_dit_load_from_pretrain=false \
+  model.depth_experiment.mode="${DEPTH_MODE}" \
   "$@"

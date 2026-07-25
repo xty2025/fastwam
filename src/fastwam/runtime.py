@@ -176,6 +176,10 @@ def create_fastwam_dit(
     flow_dit_config=None,
     flow_scheduler=None,
     loss=None,
+    depth_mode: str = "future_denoise",
+    depth_mask_ratio: float = 0.4,
+    depth_mask_block_size: int = 4,
+    loss_lambda_masked_depth: float = 1.0,
     mot_checkpoint_mixed_attn: bool = True,
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
@@ -257,6 +261,10 @@ def create_fastwam_dit(
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
         loss_lambda_flow=float(loss.get("lambda_flow", 1.0)),
+        depth_mode=str(depth_mode),
+        depth_mask_ratio=float(depth_mask_ratio),
+        depth_mask_block_size=int(depth_mask_block_size),
+        loss_lambda_masked_depth=float(loss_lambda_masked_depth),
     )
 
 
@@ -268,6 +276,7 @@ def create_fastwam_depth(**kwargs):
     """
     depth_dit_config = kwargs.pop("depth_dit_config", None)
     depth_scheduler = kwargs.pop("depth_scheduler", None)
+    depth_experiment = kwargs.pop("depth_experiment", None)
     loss = kwargs.get("loss")
     if depth_dit_config is not None:
         kwargs["flow_dit_config"] = depth_dit_config
@@ -277,6 +286,24 @@ def create_fastwam_depth(**kwargs):
         loss = dict(loss)
         loss["lambda_flow"] = loss["lambda_depth"]
         kwargs["loss"] = loss
+    if depth_experiment is not None:
+        if isinstance(depth_experiment, DictConfig):
+            depth_experiment = OmegaConf.to_container(depth_experiment, resolve=True)
+        if not isinstance(depth_experiment, dict):
+            raise ValueError(
+                "`depth_experiment` must be dict-like when provided, "
+                f"got {type(depth_experiment)}"
+            )
+        kwargs.update(
+            {
+                "depth_mode": depth_experiment.get("mode", "future_denoise"),
+                "depth_mask_ratio": depth_experiment.get("mask_ratio", 0.4),
+                "depth_mask_block_size": depth_experiment.get("mask_block_size", 4),
+                "loss_lambda_masked_depth": depth_experiment.get(
+                    "lambda_masked_depth", 1.0
+                ),
+            }
+        )
     return create_fastwam_dit(**kwargs)
 
 # ********** create FastWAM joint with video and action DiTs **********
