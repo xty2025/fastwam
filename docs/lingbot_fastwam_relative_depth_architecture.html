@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LingBot-inspired RMDM-FastWAM</title>
+  <style>
+    :root {
+      --ink: #223044;
+      --muted: #657386;
+      --paper: #fbfaf7;
+      --line: #c7ced4;
+      --base: #dce6f2;
+      --base-line: #5b7fa3;
+      --new: #f4ddc3;
+      --new-line: #c27b3f;
+      --loss: #e8d9e8;
+      --loss-line: #95739b;
+      --lingbot: #dde9df;
+      --lingbot-line: #6e8d73;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--paper);
+      font-family: Inter, "Segoe UI", "Microsoft YaHei", sans-serif;
+      line-height: 1.55;
+    }
+    main { max-width: 1480px; margin: 0 auto; padding: 34px 30px 56px; }
+    h1 { margin: 0; font-size: 30px; }
+    h2 { margin: 34px 0 12px; font-size: 22px; }
+    p { margin: 8px 0; }
+    .subtitle { color: var(--muted); max-width: 960px; }
+    .notice {
+      margin: 22px 0;
+      padding: 12px 15px;
+      border-left: 4px solid var(--new-line);
+      background: #fff7ed;
+    }
+    .legend { display: flex; flex-wrap: wrap; gap: 12px 20px; margin: 18px 0; color: var(--muted); }
+    .legend span::before {
+      display: inline-block;
+      width: 14px; height: 14px; margin-right: 7px;
+      vertical-align: -2px; border: 1px solid;
+      content: "";
+    }
+    .legend .base::before { background: var(--base); border-color: var(--base-line); }
+    .legend .new::before { background: var(--new); border-color: var(--new-line); }
+    .legend .lingbot::before { background: var(--lingbot); border-color: var(--lingbot-line); }
+    .legend .loss::before { background: var(--loss); border-color: var(--loss-line); }
+    .diagram { overflow-x: auto; border: 1px solid var(--line); background: #fff; border-radius: 12px; padding: 12px; }
+    svg { min-width: 1280px; width: 100%; height: auto; display: block; }
+    .node { stroke-width: 2; rx: 10; ry: 10; }
+    .base { fill: var(--base); stroke: var(--base-line); }
+    .new { fill: var(--new); stroke: var(--new-line); }
+    .lingbot { fill: var(--lingbot); stroke: var(--lingbot-line); }
+    .loss { fill: var(--loss); stroke: var(--loss-line); }
+    .note { fill: #f5f2ec; stroke: #8a9199; stroke-width: 1.5; stroke-dasharray: 5 4; rx: 10; ry: 10; }
+    .title { font-size: 21px; font-weight: 700; fill: var(--ink); }
+    .label { font-size: 16px; font-weight: 650; fill: var(--ink); }
+    .small { font-size: 13px; fill: #46556a; }
+    .tiny { font-size: 12px; fill: #657386; }
+    .arrow { fill: none; stroke: #53677e; stroke-width: 2.4; marker-end: url(#arrow); }
+    .arrow-new { fill: none; stroke: var(--new-line); stroke-width: 2.6; marker-end: url(#arrow-new); }
+    .arrow-dashed { fill: none; stroke: #53677e; stroke-width: 2.2; stroke-dasharray: 7 5; marker-end: url(#arrow); }
+    .stage { fill: #f7f7f4; stroke: #d6d9dc; stroke-width: 1.5; rx: 14; ry: 14; }
+    .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+    .card { border: 1px solid var(--line); border-radius: 10px; padding: 16px; background: #fff; }
+    .card h3 { margin: 0 0 8px; font-size: 17px; }
+    code { color: #6d3b1a; background: #fff1df; padding: 1px 5px; border-radius: 4px; }
+    ul { margin: 8px 0 0; padding-left: 20px; }
+    @media (max-width: 840px) { .grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>LingBot-inspired RMDM-FastWAM：相对深度 RGB 的时序深度建模</h1>
+    <p class="subtitle">
+      左侧是 LingBot-Depth 的原始思想；右侧是 FastWAM 中已经存在的时序深度分支，加上建议新增的
+      Masked Relative-Depth Modeling（RMDM）adapter。
+    </p>
+    <div class="notice">
+      <strong>状态说明：</strong>蓝色模块已在当前 <code>depth-fastwam</code> 代码中；橙色模块是建议新增的 LingBot-inspired MDM 部分，
+      尚未写入训练代码。它不是把 LingBot-Depth 的完整 DINOv2/ConvStack 复制进来。
+    </div>
+    <div class="legend">
+      <span class="lingbot">LingBot-Depth 原始思路</span>
+      <span class="base">当前 FastWAM 已实现</span>
+      <span class="new">拟新增 RMDM 模块</span>
+      <span class="loss">训练损失</span>
+    </div>
+
+    <div class="diagram">
+      <svg viewBox="0 0 1440 1050" role="img" aria-label="LingBot-inspired RMDM-FastWAM architecture">
+        <defs>
+          <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+            <path d="M0,0 L0,6 L9,3 z" fill="#53677e"></path>
+          </marker>
+          <marker id="arrow-new" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+            <path d="M0,0 L0,6 L9,3 z" fill="#c27b3f"></path>
+          </marker>
+        </defs>
+
+        <rect class="stage" x="22" y="24" width="610" height="470"></rect>
+        <text class="title" x="48" y="59">A. LingBot-Depth：原始 Masked Depth Modeling</text>
+        <text class="tiny" x="48" y="84">静态 RGB-D；核心是“遮 depth token，用 RGB 恢复深度”</text>
+
+        <rect class="node lingbot" x="64" y="132" width="180" height="76"></rect>
+        <text class="label" x="111" y="162">RGB 图像</text>
+        <text class="small" x="86" y="187">完整可见 RGB token</text>
+        <rect class="node lingbot" x="64" y="278" width="180" height="76"></rect>
+        <text class="label" x="99" y="308">原始 depth</text>
+        <text class="small" x="84" y="333">部分 depth token 遮挡</text>
+        <path class="arrow" d="M244 170 L302 170"></path>
+        <path class="arrow" d="M244 316 L302 316"></path>
+
+        <rect class="node lingbot" x="302" y="132" width="152" height="76"></rect>
+        <text class="label" x="326" y="163">RGB patch</text>
+        <text class="small" x="322" y="188">embedding</text>
+        <rect class="node lingbot" x="302" y="278" width="152" height="76"></rect>
+        <text class="label" x="316" y="309">Depth patch</text>
+        <text class="small" x="325" y="334">+ mask token</text>
+        <path class="arrow" d="M454 170 L502 211"></path>
+        <path class="arrow" d="M454 316 L502 258"></path>
+
+        <rect class="node lingbot" x="502" y="180" width="98" height="124"></rect>
+        <text class="label" x="517" y="221">Joint</text>
+        <text class="label" x="521" y="244">ViT</text>
+        <text class="small" x="515" y="268">RGB ↔ depth</text>
+        <path class="arrow" d="M551 304 L551 377"></path>
+        <rect class="node lingbot" x="454" y="377" width="194" height="76"></rect>
+        <text class="label" x="480" y="408">ConvStack decoder</text>
+        <text class="small" x="473" y="433">metric depth reconstruction</text>
+
+        <rect class="stage" x="662" y="24" width="756" height="1000"></rect>
+        <text class="title" x="688" y="59">B. RMDM-FastWAM：相对深度 RGB 的时序实现</text>
+        <text class="tiny" x="688" y="84">不加新 DiT；Depth DiT 是预训练 Video DiT 的副本；D0 用 MDM，D1:8 用未来去噪</text>
+
+        <rect class="node base" x="700" y="126" width="170" height="74"></rect>
+        <text class="label" x="733" y="156">RGB Video</text>
+        <text class="small" x="721" y="181">V0, V1 ... V8</text>
+        <rect class="node base" x="700" y="264" width="170" height="74"></rect>
+        <text class="label" x="714" y="294">Relative-depth RGB</text>
+        <text class="small" x="729" y="319">D0, D1 ... D8</text>
+        <rect class="node base" x="700" y="402" width="170" height="74"></rect>
+        <text class="label" x="744" y="432">Action</text>
+        <text class="small" x="729" y="457">A0 ... A7</text>
+
+        <path class="arrow" d="M870 163 L932 163"></path>
+        <path class="arrow" d="M870 301 L932 301"></path>
+        <path class="arrow" d="M870 439 L932 439"></path>
+
+        <rect class="node base" x="932" y="126" width="163" height="74"></rect>
+        <text class="label" x="967" y="156">Wan Video VAE</text>
+        <text class="small" x="963" y="181">Video latent zV</text>
+        <rect class="node base" x="932" y="264" width="163" height="74"></rect>
+        <text class="label" x="967" y="294">Same Wan VAE</text>
+        <text class="small" x="953" y="319">Depth latent zD</text>
+        <rect class="node base" x="932" y="402" width="163" height="74"></rect>
+        <text class="label" x="968" y="432">Action DiT</text>
+        <text class="small" x="949" y="457">noised action token</text>
+
+        <path class="arrow" d="M1095 163 L1144 163"></path>
+        <rect class="node base" x="1144" y="126" width="166" height="74"></rect>
+        <text class="label" x="1184" y="156">Video DiT</text>
+        <text class="small" x="1166" y="181">V0 clean, V1:8 noisy</text>
+
+        <path class="arrow-new" d="M1095 301 L1144 301"></path>
+        <rect class="node new" x="1144" y="256" width="166" height="92"></rect>
+        <text class="label" x="1171" y="286">RMDM adapter</text>
+        <text class="small" x="1163" y="310">mask zD blocks</text>
+        <text class="small" x="1163" y="331">+ MaskEmbedding</text>
+
+        <rect class="node new" x="926" y="530" width="202" height="80"></rect>
+        <text class="label" x="953" y="559">Depth mask mD</text>
+        <text class="small" x="944" y="584">visibility 或随机块遮挡</text>
+        <path class="arrow-new" d="M1027 530 L1027 348"></path>
+
+        <path class="arrow-new" d="M1227 348 L1227 410"></path>
+        <rect class="node base" x="1144" y="410" width="166" height="82"></rect>
+        <text class="label" x="1184" y="442">Depth DiT</text>
+        <text class="small" x="1154" y="466">Video DiT pretrained copy</text>
+
+        <path class="arrow" d="M1310 163 L1354 263"></path>
+        <path class="arrow" d="M1310 451 L1354 334"></path>
+        <path class="arrow-new" d="M1310 451 L1354 334"></path>
+        <rect class="node base" x="1336" y="243" width="58" height="214"></rect>
+        <text class="label" x="1348" y="290">M</text>
+        <text class="label" x="1348" y="315">o</text>
+        <text class="label" x="1348" y="340">T</text>
+        <text class="small" x="1343" y="379">mix</text>
+        <text class="small" x="1343" y="398">attn</text>
+        <path class="arrow" d="M1394 350 L1394 612"></path>
+
+        <rect class="node note" x="1110" y="530" width="282" height="80"></rect>
+        <text class="label" x="1130" y="558">注意力方向</text>
+        <text class="small" x="1130" y="580">Depth → Video / Action / Depth ✓</text>
+        <text class="small" x="1130" y="600">Video / Action → Depth ✗</text>
+
+        <rect class="node loss" x="1014" y="648" width="162" height="78"></rect>
+        <text class="label" x="1040" y="679">L_future_depth</text>
+        <text class="small" x="1044" y="704">仅 D1:8 去噪</text>
+        <rect class="node loss" x="1218" y="648" width="162" height="78"></rect>
+        <text class="label" x="1256" y="679">L_mrdm</text>
+        <text class="small" x="1233" y="704">仅 D0 被遮块</text>
+        <path class="arrow" d="M1394 612 L1095 648"></path>
+        <path class="arrow-new" d="M1394 612 L1299 648"></path>
+
+        <rect class="node loss" x="1116" y="782" width="218" height="98"></rect>
+        <text class="label" x="1169" y="815">L_total</text>
+        <text class="small" x="1136" y="840">L_video + L_action +</text>
+        <text class="small" x="1136" y="861">λdepth Lfuture + λmrdm Lmrdm</text>
+        <path class="arrow" d="M1095 726 L1194 782"></path>
+        <path class="arrow-new" d="M1299 726 L1260 782"></path>
+
+        <rect class="node note" x="710" y="918" width="656" height="70"></rect>
+        <text class="label" x="735" y="946">深度图具体做了什么？</text>
+        <text class="small" x="735" y="969">D0：遮掉局部 latent → 让 Depth DiT 通过 RGB 视频补结构；D1:8：作为未来目标做 flow-matching 去噪。</text>
+      </svg>
+    </div>
+
+    <h2>按帧解释：深度图到底干了什么？</h2>
+    <div class="grid">
+      <section class="card">
+        <h3>1. 当前深度帧 D0</h3>
+        <p>先将相对深度 RGB 归一化并经 Wan VAE 编成 <code>zD0</code>。随后仅遮掉部分 latent block，mask 区域不可直接复制。</p>
+        <p>Depth DiT 读取 Video token，以 RGB 空间语义恢复被遮区域；只在被遮块上计算 <code>L_mrdm</code>。</p>
+      </section>
+      <section class="card">
+        <h3>2. 未来深度帧 D1:8</h3>
+        <p>经同一个 Wan VAE 获得 <code>zD1:8</code>，再按 continuous flow matching 加噪。</p>
+        <p>Depth DiT 预测去噪方向，只对未来八帧计算 <code>L_future_depth</code>；第 0 帧不参与未来预测 loss。</p>
+      </section>
+      <section class="card">
+        <h3>3. 防止深度泄漏</h3>
+        <p>Depth query 可以读取 Video、Action 与自身 token；Video 和 Action query 不读取 Depth token。</p>
+        <p>因此深度是辅助重建/监督信号，不会把未来深度标签直接泄漏给 Video 或 Action 分支。</p>
+      </section>
+    </div>
+  </main>
+</body>
+</html>
