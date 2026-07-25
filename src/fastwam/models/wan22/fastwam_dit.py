@@ -381,7 +381,11 @@ class FastWAMDiT(FastWAM):
                 "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
             }
 
-            if flow_pre is not None:
+            is_genception_depth_mode = (
+                aux_name == "depth"
+                and self.depth_mode == "rgb_to_depth_perception"
+            )
+            if flow_pre is not None and not is_genception_depth_mode:
                 pred_flow = self.flow_expert.post_dit(tokens_out["flow"], flow_pre)
                 if aux_name == "depth" and self.depth_mode != "rgb_to_depth_perception":
                     pred_flow = pred_flow[:, :, 1:]
@@ -426,12 +430,35 @@ class FastWAMDiT(FastWAM):
                         self.loss_lambda_masked_depth
                         * float(loss_masked_depth.detach().item())
                     )
+            if is_genception_depth_mode:
+                loss_depth_perception = self._compute_rgb_to_depth_perception_loss(
+                    rgb_latents=input_latents,
+                    depth_latents=flow_latents,
+                    action_pre=action_pre,
+                    context=context,
+                    context_mask=context_mask,
+                    action=action,
+                    fuse_vae_embedding_in_latents=inputs[
+                        "fuse_vae_embedding_in_latents"
+                    ],
+                    depth_visible=sample.get("depth_visible"),
+                )
+                loss_total = loss_total + self.loss_lambda_flow * loss_depth_perception
+                loss_dict["loss_depth_perception"] = self.loss_lambda_flow * float(
+                    loss_depth_perception.detach().item()
+                )
             return loss_total, loss_dict
 
         aux_name = "depth" if "depth_rgb" in sample else "flow"
         aux_rgb = sample.get("depth_rgb", sample.get("flow_rgb"))
         if aux_rgb is None:
             return loss_total, loss_dict
+        if aux_name == "depth" and self.depth_mode == "rgb_to_depth_perception":
+            raise ValueError(
+                "`rgb_to_depth_perception` requires joint Video/Action training "
+                "because its clean RGB-video condition is intentionally not "
+                "available in flow-only training."
+            )
 
         context = sample["context"].to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
         context_mask = sample["context_mask"].to(device=self.device, dtype=torch.bool, non_blocking=True)
@@ -786,6 +813,102 @@ class FastWAMDiT(FastWAM):
             )
         flow_rgb = flow_rgb.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
         return self._encode_video_latents(flow_rgb, tiled=tiled)
+
+    def _compute_rgb_to_depth_perception_loss(
+        self,
+        *,
+        rgb_latents: torch.Tensor,
+        depth_latents: torch.Tensor,
+        action_pre: dict[str, Any],
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        action: torch.Tensor,
+        fuse_vae_embedding_in_latents: bool,
+        depth_visible: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run the strict GenCeption-style clean-RGB to relative-depth path.
+
+        Video and Action keep their normal diffusion losses in the caller.  This
+        second MoT pass receives clean RGB-video latents and an all-zero depth
+        query, so the depth prediction has no depth-latent input shortcut.
+        """
+        batch_size = rgb_latents.shape[0]
+        zero_timestep = torch.zeros(
+            (batch_size,),
+            device=rgb_latents.device,
+            dtype=rgb_latents.dtype,
+        )
+        rgb_pre = self.video_expert.pre_dit(
+            x=rgb_latents,
+            timestep=zero_timestep,
+            context=context,
+            context_mask=context_mask,
+            action=action,
+            fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
+        )
+        depth_pre = self.flow_expert.pre_dit(
+            x=torch.zeros_like(depth_latents),
+            timestep=zero_timestep.to(dtype=depth_latents.dtype),
+            context=context,
+            context_mask=context_mask,
+            action=None,
+            fuse_vae_embedding_in_latents=bool(
+                getattr(self.depth_expert, "fuse_vae_embedding_in_latents", False)
+            ),
+        )
+        attention_mask = self._build_mot_attention_mask_with_flow(
+            video_seq_len=rgb_pre["tokens"].shape[1],
+            action_seq_len=action_pre["tokens"].shape[1],
+            flow_seq_len=depth_pre["tokens"].shape[1],
+            video_tokens_per_frame=int(rgb_pre["meta"]["tokens_per_frame"]),
+            device=rgb_pre["tokens"].device,
+        )
+        tokens_out = self.mot(
+            embeds_all={
+                "video": rgb_pre["tokens"],
+                "action": action_pre["tokens"],
+                "flow": depth_pre["tokens"],
+            },
+            attention_mask=attention_mask,
+            freqs_all={
+                "video": rgb_pre["freqs"],
+                "action": action_pre["freqs"],
+                "flow": depth_pre["freqs"],
+            },
+            context_all={
+                "video": {
+                    "context": rgb_pre["context"],
+                    "mask": rgb_pre["context_mask"],
+                },
+                "action": {
+                    "context": action_pre["context"],
+                    "mask": action_pre["context_mask"],
+                },
+                "flow": {
+                    "context": depth_pre["context"],
+                    "mask": depth_pre["context_mask"],
+                },
+            },
+            t_mod_all={
+                "video": rgb_pre["t_mod"],
+                "action": action_pre["t_mod"],
+                "flow": depth_pre["t_mod"],
+            },
+        )
+        pred_velocity = self.flow_expert.post_dit(tokens_out["flow"], depth_pre)
+        squared_error = F.mse_loss(
+            pred_velocity.float(),
+            (-depth_latents).float(),
+            reduction="none",
+        )
+        if depth_visible is None:
+            return squared_error.mean()
+        visible = self._latent_visibility_mask(
+            depth_visible,
+            depth_latents,
+            name="depth_visible",
+        ).to(dtype=squared_error.dtype)
+        return (squared_error * visible).sum() / visible.sum().clamp_min(1.0)
 
     def _sample_future_depth_block_mask(self, latents: torch.Tensor) -> torch.Tensor:
         """Sample a spatial block mask on D1:8 at Wan-VAE latent resolution."""
